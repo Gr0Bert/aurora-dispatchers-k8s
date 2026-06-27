@@ -1,10 +1,10 @@
-module aurora-dispatchers-k8s
+module github.com/aurora-capcompute/aurora-dispatchers-k8s
 
 go 1.26
 
 require (
-	aurora-dispatchers v0.0.0
-	capcompute v0.0.0
+	github.com/aurora-capcompute/aurora-dispatchers v0.0.0-00010101000000-000000000000
+	github.com/aurora-capcompute/capcompute v0.0.0-00010101000000-000000000000
 	k8s.io/api v0.33.1
 	k8s.io/apimachinery v0.33.1
 	k8s.io/client-go v0.33.1
@@ -50,6 +50,4 @@ require (
 	sigs.k8s.io/yaml v1.4.0 // indirect
 )
 
-replace aurora-dispatchers => ../aurora-dispatchers
 
-replace capcompute => ../capcompute

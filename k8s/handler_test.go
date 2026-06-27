@@ -1,8 +1,8 @@
 package k8s
 
 import (
-	"aurora-dispatchers/resolution"
-	"capcompute/dispatcher"
+	"github.com/aurora-capcompute/aurora-dispatchers/resolution"
+	"github.com/aurora-capcompute/capcompute/dispatcher"
 	"context"
 	"encoding/json"
 	"testing"

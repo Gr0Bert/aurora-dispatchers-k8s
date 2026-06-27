@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"strings"
 
-	"aurora-dispatchers/builtin"
-	"aurora-dispatchers/registry"
-	"capcompute/dispatcher"
+	"github.com/aurora-capcompute/aurora-dispatchers/builtin"
+	"github.com/aurora-capcompute/aurora-dispatchers/registry"
+	"github.com/aurora-capcompute/capcompute/dispatcher"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 

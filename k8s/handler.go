@@ -1,9 +1,9 @@
 package k8s
 
 import (
-	"aurora-dispatchers/builtin"
-	"aurora-dispatchers/resolution"
-	"capcompute/dispatcher"
+	"github.com/aurora-capcompute/aurora-dispatchers/builtin"
+	"github.com/aurora-capcompute/aurora-dispatchers/resolution"
+	"github.com/aurora-capcompute/capcompute/dispatcher"
 	"context"
 	"encoding/json"
 	"fmt"
