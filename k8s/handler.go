@@ -2,7 +2,6 @@ package k8s
 
 import (
 	"github.com/aurora-capcompute/aurora-dispatchers/builtin"
-	"github.com/aurora-capcompute/aurora-dispatchers/resolution"
 	"github.com/aurora-capcompute/capcompute/dispatcher"
 	"context"
 	"encoding/json"
@@ -43,36 +42,36 @@ func (h *Handler) Handles(name string) bool {
 	return ok
 }
 
-func (h *Handler) DispatchCall(ctx context.Context, call dispatcher.Call) (dispatcher.Outcome, error) {
+func (h *Handler) DispatchCall(ctx context.Context, call dispatcher.Call, auth dispatcher.Authorization) (dispatcher.Outcome, error) {
 	cap, ok := h.capabilities[call.Name]
 	if !ok {
-		return dispatcher.Failed("unknown k8s call: " + call.Name), nil
+		return dispatcher.Fail("unknown k8s call: " + call.Name), nil
 	}
 
 	switch call.Name {
 	case "k8s.get":
-		return h.dispatchGet(ctx, call, cap)
+		return h.dispatchGet(ctx, call, cap, auth)
 	case "k8s.list":
-		return h.dispatchList(ctx, call, cap)
+		return h.dispatchList(ctx, call, cap, auth)
 	case "k8s.apply":
-		return h.dispatchApply(ctx, call, cap)
+		return h.dispatchApply(ctx, call, cap, auth)
 	case "k8s.delete":
-		return h.dispatchDelete(ctx, call, cap)
+		return h.dispatchDelete(ctx, call, cap, auth)
 	case "k8s.logs":
-		return h.dispatchLogs(ctx, call, cap)
+		return h.dispatchLogs(ctx, call, cap, auth)
 	case "k8s.events":
-		return h.dispatchEvents(ctx, call, cap)
+		return h.dispatchEvents(ctx, call, cap, auth)
 	default:
-		return dispatcher.Failed("unsupported k8s operation: " + call.Name), nil
+		return dispatcher.Fail("unsupported k8s operation: " + call.Name), nil
 	}
 }
 
-func (h *Handler) dispatchGet(ctx context.Context, call dispatcher.Call, cap capabilityConfig) (dispatcher.Outcome, error) {
+func (h *Handler) dispatchGet(ctx context.Context, call dispatcher.Call, cap capabilityConfig, auth dispatcher.Authorization) (dispatcher.Outcome, error) {
 	var req GetRequest
 	if err := json.Unmarshal(call.Args, &req); err != nil {
-		return dispatcher.Failed(fmt.Sprintf("decode k8s.get: %v", err)), nil
+		return dispatcher.Fail(fmt.Sprintf("decode k8s.get: %v", err)), nil
 	}
-	if err := checkApproval(ctx, cap, fmt.Sprintf("k8s.get %s/%s %s", req.Kind, req.Name, req.Namespace)); err != nil {
+	if err := checkApproval(auth, cap, fmt.Sprintf("k8s.get %s/%s %s", req.Kind, req.Name, req.Namespace)); err != nil {
 		return *err, nil
 	}
 	obj, err := h.client.Get(ctx, req)
@@ -80,17 +79,17 @@ func (h *Handler) dispatchGet(ctx context.Context, call dispatcher.Call, cap cap
 		if ctx.Err() != nil {
 			return dispatcher.Outcome{}, ctx.Err()
 		}
-		return dispatcher.Failed(err.Error()), nil
+		return dispatcher.Fail(err.Error()), nil
 	}
 	return marshalResult(GetResponse{Resource: mustJSON(obj)})
 }
 
-func (h *Handler) dispatchList(ctx context.Context, call dispatcher.Call, cap capabilityConfig) (dispatcher.Outcome, error) {
+func (h *Handler) dispatchList(ctx context.Context, call dispatcher.Call, cap capabilityConfig, auth dispatcher.Authorization) (dispatcher.Outcome, error) {
 	var req ListRequest
 	if err := json.Unmarshal(call.Args, &req); err != nil {
-		return dispatcher.Failed(fmt.Sprintf("decode k8s.list: %v", err)), nil
+		return dispatcher.Fail(fmt.Sprintf("decode k8s.list: %v", err)), nil
 	}
-	if err := checkApproval(ctx, cap, fmt.Sprintf("k8s.list %s/%s", req.Kind, req.Namespace)); err != nil {
+	if err := checkApproval(auth, cap, fmt.Sprintf("k8s.list %s/%s", req.Kind, req.Namespace)); err != nil {
 		return *err, nil
 	}
 	list, err := h.client.List(ctx, req)
@@ -98,7 +97,7 @@ func (h *Handler) dispatchList(ctx context.Context, call dispatcher.Call, cap ca
 		if ctx.Err() != nil {
 			return dispatcher.Outcome{}, ctx.Err()
 		}
-		return dispatcher.Failed(err.Error()), nil
+		return dispatcher.Fail(err.Error()), nil
 	}
 	items := make([]json.RawMessage, 0, len(list.Items))
 	for _, item := range list.Items {
@@ -107,10 +106,10 @@ func (h *Handler) dispatchList(ctx context.Context, call dispatcher.Call, cap ca
 	return marshalResult(ListResponse{Items: items, Count: len(items)})
 }
 
-func (h *Handler) dispatchApply(ctx context.Context, call dispatcher.Call, cap capabilityConfig) (dispatcher.Outcome, error) {
+func (h *Handler) dispatchApply(ctx context.Context, call dispatcher.Call, cap capabilityConfig, auth dispatcher.Authorization) (dispatcher.Outcome, error) {
 	var req ApplyRequest
 	if err := json.Unmarshal(call.Args, &req); err != nil {
-		return dispatcher.Failed(fmt.Sprintf("decode k8s.apply: %v", err)), nil
+		return dispatcher.Fail(fmt.Sprintf("decode k8s.apply: %v", err)), nil
 	}
 	var meta struct {
 		Kind     string `json:"kind"`
@@ -121,13 +120,13 @@ func (h *Handler) dispatchApply(ctx context.Context, call dispatcher.Call, cap c
 	}
 	_ = json.Unmarshal(req.Resource, &meta)
 	if err := cap.policy.check(meta.Metadata.Namespace, true); err != nil {
-		return dispatcher.Failed(err.Error()), nil
+		return dispatcher.Fail(err.Error()), nil
 	}
 	summary := fmt.Sprintf("k8s.apply %s/%s", meta.Kind, meta.Metadata.Name)
 	if meta.Metadata.Namespace != "" {
 		summary += " in " + meta.Metadata.Namespace
 	}
-	if err := checkApproval(ctx, cap, summary); err != nil {
+	if err := checkApproval(auth, cap, summary); err != nil {
 		return *err, nil
 	}
 	obj, action, err := h.client.Apply(ctx, req)
@@ -135,41 +134,41 @@ func (h *Handler) dispatchApply(ctx context.Context, call dispatcher.Call, cap c
 		if ctx.Err() != nil {
 			return dispatcher.Outcome{}, ctx.Err()
 		}
-		return dispatcher.Failed(err.Error()), nil
+		return dispatcher.Fail(err.Error()), nil
 	}
 	return marshalResult(ApplyResponse{Resource: mustJSON(obj), Action: action})
 }
 
-func (h *Handler) dispatchDelete(ctx context.Context, call dispatcher.Call, cap capabilityConfig) (dispatcher.Outcome, error) {
+func (h *Handler) dispatchDelete(ctx context.Context, call dispatcher.Call, cap capabilityConfig, auth dispatcher.Authorization) (dispatcher.Outcome, error) {
 	var req DeleteRequest
 	if err := json.Unmarshal(call.Args, &req); err != nil {
-		return dispatcher.Failed(fmt.Sprintf("decode k8s.delete: %v", err)), nil
+		return dispatcher.Fail(fmt.Sprintf("decode k8s.delete: %v", err)), nil
 	}
 	if err := cap.policy.check(req.Namespace, true); err != nil {
-		return dispatcher.Failed(err.Error()), nil
+		return dispatcher.Fail(err.Error()), nil
 	}
 	summary := fmt.Sprintf("k8s.delete %s/%s/%s", req.Kind, req.Namespace, req.Name)
-	if err := checkApproval(ctx, cap, summary); err != nil {
+	if err := checkApproval(auth, cap, summary); err != nil {
 		return *err, nil
 	}
 	if err := h.client.Delete(ctx, req); err != nil {
 		if ctx.Err() != nil {
 			return dispatcher.Outcome{}, ctx.Err()
 		}
-		return dispatcher.Failed(err.Error()), nil
+		return dispatcher.Fail(err.Error()), nil
 	}
 	return marshalResult(DeleteResponse{Deleted: true, Name: req.Name})
 }
 
-func (h *Handler) dispatchLogs(ctx context.Context, call dispatcher.Call, cap capabilityConfig) (dispatcher.Outcome, error) {
+func (h *Handler) dispatchLogs(ctx context.Context, call dispatcher.Call, cap capabilityConfig, auth dispatcher.Authorization) (dispatcher.Outcome, error) {
 	var req LogsRequest
 	if err := json.Unmarshal(call.Args, &req); err != nil {
-		return dispatcher.Failed(fmt.Sprintf("decode k8s.logs: %v", err)), nil
+		return dispatcher.Fail(fmt.Sprintf("decode k8s.logs: %v", err)), nil
 	}
 	if err := cap.policy.check(req.Namespace, true); err != nil {
-		return dispatcher.Failed(err.Error()), nil
+		return dispatcher.Fail(err.Error()), nil
 	}
-	if err := checkApproval(ctx, cap, fmt.Sprintf("k8s.logs %s/%s", req.Namespace, req.Name)); err != nil {
+	if err := checkApproval(auth, cap, fmt.Sprintf("k8s.logs %s/%s", req.Namespace, req.Name)); err != nil {
 		return *err, nil
 	}
 	logs, err := h.client.Logs(ctx, req)
@@ -177,17 +176,17 @@ func (h *Handler) dispatchLogs(ctx context.Context, call dispatcher.Call, cap ca
 		if ctx.Err() != nil {
 			return dispatcher.Outcome{}, ctx.Err()
 		}
-		return dispatcher.Failed(err.Error()), nil
+		return dispatcher.Fail(err.Error()), nil
 	}
 	return marshalResult(LogsResponse{Logs: logs})
 }
 
-func (h *Handler) dispatchEvents(ctx context.Context, call dispatcher.Call, cap capabilityConfig) (dispatcher.Outcome, error) {
+func (h *Handler) dispatchEvents(ctx context.Context, call dispatcher.Call, cap capabilityConfig, auth dispatcher.Authorization) (dispatcher.Outcome, error) {
 	var req EventsRequest
 	if err := json.Unmarshal(call.Args, &req); err != nil {
-		return dispatcher.Failed(fmt.Sprintf("decode k8s.events: %v", err)), nil
+		return dispatcher.Fail(fmt.Sprintf("decode k8s.events: %v", err)), nil
 	}
-	if err := checkApproval(ctx, cap, fmt.Sprintf("k8s.events %s", req.Namespace)); err != nil {
+	if err := checkApproval(auth, cap, fmt.Sprintf("k8s.events %s", req.Namespace)); err != nil {
 		return *err, nil
 	}
 	list, err := h.client.Events(ctx, req)
@@ -195,7 +194,7 @@ func (h *Handler) dispatchEvents(ctx context.Context, call dispatcher.Call, cap 
 		if ctx.Err() != nil {
 			return dispatcher.Outcome{}, ctx.Err()
 		}
-		return dispatcher.Failed(err.Error()), nil
+		return dispatcher.Fail(err.Error()), nil
 	}
 	items := make([]json.RawMessage, 0, len(list.Items))
 	for _, item := range list.Items {
@@ -204,11 +203,11 @@ func (h *Handler) dispatchEvents(ctx context.Context, call dispatcher.Call, cap 
 	return marshalResult(EventsResponse{Items: items, Count: len(items)})
 }
 
-func checkApproval(ctx context.Context, cap capabilityConfig, summary string) *dispatcher.Outcome {
+func checkApproval(auth dispatcher.Authorization, cap capabilityConfig, summary string) *dispatcher.Outcome {
 	if !cap.requireApproval {
 		return nil
 	}
-	if resolved, ok := resolution.FromContext(ctx); ok && resolved.Decision == resolution.Approved {
+	if auth.Decision == dispatcher.Approved {
 		return nil
 	}
 	outcome := dispatcher.Yield(fmt.Sprintf("Approve: %s", strings.TrimSpace(summary)))

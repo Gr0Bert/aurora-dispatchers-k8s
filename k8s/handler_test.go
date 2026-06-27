@@ -1,7 +1,6 @@
 package k8s
 
 import (
-	"github.com/aurora-capcompute/aurora-dispatchers/resolution"
 	"github.com/aurora-capcompute/capcompute/dispatcher"
 	"context"
 	"encoding/json"
@@ -61,7 +60,7 @@ func TestReadOperationsReturnResultImmediately(t *testing.T) {
 	outcome, err := h.DispatchCall(ctx, dispatcher.Call{
 		Name: "k8s.get",
 		Args: json.RawMessage(`{"api_version":"v1","kind":"Pod","name":"nginx"}`),
-	})
+	}, dispatcher.Authorization{})
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -72,7 +71,7 @@ func TestReadOperationsReturnResultImmediately(t *testing.T) {
 	outcome, err = h.DispatchCall(ctx, dispatcher.Call{
 		Name: "k8s.list",
 		Args: json.RawMessage(`{"api_version":"v1","kind":"Pod"}`),
-	})
+	}, dispatcher.Authorization{})
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -83,7 +82,7 @@ func TestReadOperationsReturnResultImmediately(t *testing.T) {
 	outcome, err = h.DispatchCall(ctx, dispatcher.Call{
 		Name: "k8s.logs",
 		Args: json.RawMessage(`{"name":"nginx"}`),
-	})
+	}, dispatcher.Authorization{})
 	if err != nil {
 		t.Fatalf("logs: %v", err)
 	}
@@ -94,7 +93,7 @@ func TestReadOperationsReturnResultImmediately(t *testing.T) {
 	outcome, err = h.DispatchCall(ctx, dispatcher.Call{
 		Name: "k8s.events",
 		Args: json.RawMessage(`{}`),
-	})
+	}, dispatcher.Authorization{})
 	if err != nil {
 		t.Fatalf("events: %v", err)
 	}
@@ -114,7 +113,7 @@ func TestMutationYieldsWithoutApproval(t *testing.T) {
 	outcome, err := h.DispatchCall(context.Background(), dispatcher.Call{
 		Name: "k8s.apply",
 		Args: json.RawMessage(`{"resource":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"nginx","namespace":"default"}}}`),
-	})
+	}, dispatcher.Authorization{})
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -131,14 +130,10 @@ func TestMutationExecutesWithApproval(t *testing.T) {
 	h := NewHandler(mc)
 	h.AddCapability("k8s.apply", Settings{})
 
-	ctx := resolution.WithContext(context.Background(), resolution.Resolution{
-		Decision: resolution.Approved,
-	})
-
-	outcome, err := h.DispatchCall(ctx, dispatcher.Call{
+	outcome, err := h.DispatchCall(context.Background(), dispatcher.Call{
 		Name: "k8s.apply",
 		Args: json.RawMessage(`{"resource":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"nginx","namespace":"default"}}}`),
-	})
+	}, dispatcher.Authorization{Decision: dispatcher.Approved})
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -155,7 +150,7 @@ func TestDeleteYieldsWithoutApproval(t *testing.T) {
 	outcome, err := h.DispatchCall(context.Background(), dispatcher.Call{
 		Name: "k8s.delete",
 		Args: json.RawMessage(`{"api_version":"v1","kind":"Pod","namespace":"default","name":"nginx"}`),
-	})
+	}, dispatcher.Authorization{})
 	if err != nil {
 		t.Fatalf("delete: %v", err)
 	}
@@ -176,7 +171,7 @@ func TestApprovalCanBeDisabledForMutations(t *testing.T) {
 	outcome, err := h.DispatchCall(context.Background(), dispatcher.Call{
 		Name: "k8s.apply",
 		Args: json.RawMessage(`{"resource":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"nginx","namespace":"default"}}}`),
-	})
+	}, dispatcher.Authorization{})
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -196,7 +191,7 @@ func TestApprovalCanBeEnabledForReads(t *testing.T) {
 	outcome, err := h.DispatchCall(context.Background(), dispatcher.Call{
 		Name: "k8s.get",
 		Args: json.RawMessage(`{"api_version":"v1","kind":"Secret","name":"creds"}`),
-	})
+	}, dispatcher.Authorization{})
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -210,14 +205,10 @@ func TestNamespacePolicyRejectsDisallowed(t *testing.T) {
 	h := NewHandler(mc)
 	h.AddCapability("k8s.apply", Settings{Namespaces: []string{"staging"}})
 
-	ctx := resolution.WithContext(context.Background(), resolution.Resolution{
-		Decision: resolution.Approved,
-	})
-
-	outcome, err := h.DispatchCall(ctx, dispatcher.Call{
+	outcome, err := h.DispatchCall(context.Background(), dispatcher.Call{
 		Name: "k8s.apply",
 		Args: json.RawMessage(`{"resource":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"nginx","namespace":"production"}}}`),
-	})
+	}, dispatcher.Authorization{Decision: dispatcher.Approved})
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
