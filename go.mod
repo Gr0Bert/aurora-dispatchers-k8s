@@ -3,7 +3,7 @@ module github.com/aurora-capcompute/aurora-dispatchers-k8s
 go 1.26
 
 require (
-	github.com/aurora-capcompute/aurora-dispatchers v0.0.0-20260627173302-a66a00a26cc6
+	github.com/aurora-capcompute/aurora-dispatchers v0.0.0-20260629161346-52a96ac6ce45
 	github.com/aurora-capcompute/capcompute v0.0.0-20260627172717-954ff0270676
 	k8s.io/api v0.33.1
 	k8s.io/apimachinery v0.33.1
@@ -49,5 +49,3 @@ require (
 	sigs.k8s.io/structured-merge-diff/v4 v4.6.0 // indirect
 	sigs.k8s.io/yaml v1.4.0 // indirect
 )
-
-
