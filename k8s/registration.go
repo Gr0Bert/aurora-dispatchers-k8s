@@ -12,26 +12,14 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-var validOperations = map[string]struct{}{
-	"k8s.get":    {},
-	"k8s.list":   {},
-	"k8s.apply":  {},
-	"k8s.delete": {},
-	"k8s.logs":   {},
-	"k8s.events": {},
-}
+// ToolType is the manifest `type` for a Kubernetes tool.
+const ToolType = "core.k8s"
 
 type Registration struct{}
 
-func (Registration) Matches(name string) bool {
-	_, ok := validOperations[name]
-	return ok
-}
+func (Registration) Matches(toolType string) bool { return toolType == ToolType }
 
-func (Registration) Normalize(name string, raw json.RawMessage) (json.RawMessage, error) {
-	if _, ok := validOperations[name]; !ok {
-		return nil, fmt.Errorf("unsupported k8s operation %q", name)
-	}
+func (Registration) Normalize(_ string, raw json.RawMessage) (json.RawMessage, error) {
 	var settings Settings
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &settings); err != nil {
@@ -40,14 +28,14 @@ func (Registration) Normalize(name string, raw json.RawMessage) (json.RawMessage
 	}
 	settings.Kubeconfig = strings.TrimSpace(settings.Kubeconfig)
 	settings.Context = strings.TrimSpace(settings.Context)
-	cleaned := make([]string, 0, len(settings.Namespaces))
-	for _, ns := range settings.Namespaces {
-		ns = strings.TrimSpace(ns)
-		if ns != "" {
-			cleaned = append(cleaned, ns)
-		}
+	if len(settings.Permissions) == 0 {
+		return nil, fmt.Errorf("permissions must contain at least one {resource, verb, namespace}")
 	}
-	settings.Namespaces = cleaned
+	for i := range settings.Permissions {
+		settings.Permissions[i].Resource = strings.TrimSpace(settings.Permissions[i].Resource)
+		settings.Permissions[i].Verb = strings.ToLower(strings.TrimSpace(settings.Permissions[i].Verb))
+		settings.Permissions[i].Namespace = strings.TrimSpace(settings.Permissions[i].Namespace)
+	}
 	return json.Marshal(settings)
 }
 
@@ -58,7 +46,7 @@ func (Registration) Configure(
 	_ registry.Services,
 	config *builtin.Config,
 ) error {
-	normalized, err := (Registration{}).Normalize(name, raw)
+	normalized, err := (Registration{}).Normalize(ToolType, raw)
 	if err != nil {
 		return err
 	}
@@ -66,24 +54,19 @@ func (Registration) Configure(
 	if err := json.Unmarshal(normalized, &settings); err != nil {
 		return err
 	}
-
-	handler := findOrCreateHandler(config, settings)
+	handler := findOrCreateHandler(config)
 	handler.AddCapability(name, settings)
 	config.Capabilities = append(config.Capabilities, capabilityFor(name, settings))
 	return nil
 }
 
-func findOrCreateHandler(config *builtin.Config, settings Settings) *Handler {
+func findOrCreateHandler(config *builtin.Config) *Handler {
 	for _, h := range config.Handlers {
 		if kh, ok := h.(*Handler); ok {
 			return kh
 		}
 	}
-	client, err := NewClient(settings.Kubeconfig, settings.Context)
-	if err != nil {
-		client = &failedClient{err: err}
-	}
-	handler := NewHandler(client)
+	handler := NewHandler()
 	config.Handlers = append(config.Handlers, handler)
 	return handler
 }
@@ -107,79 +90,58 @@ func (c *failedClient) Events(context.Context, EventsRequest) (*unstructured.Uns
 	return nil, c.err
 }
 
-func (Registration) IsSubset(name string, parent, child json.RawMessage) error {
-	var parentSettings, childSettings Settings
-	if err := json.Unmarshal(parent, &parentSettings); err != nil {
-		return fmt.Errorf("decode parent settings: %w", err)
+// capabilityFor publishes one tool capability named by the local tool name. The
+// input schema is a discriminated union over the verbs the permissions grant.
+func capabilityFor(name string, settings Settings) dispatcher.Capability {
+	verbs := newPermissionPolicy(settings.Permissions).permittedVerbs()
+	branches := make([]json.RawMessage, 0, len(verbs))
+	for _, v := range verbs {
+		branches = append(branches, verbSchemas[v])
 	}
-	if err := json.Unmarshal(child, &childSettings); err != nil {
-		return fmt.Errorf("decode child settings: %w", err)
+	schema := json.RawMessage(`{"type":"object"}`)
+	if len(branches) > 0 {
+		oneOf, _ := json.Marshal(map[string]any{"oneOf": branches})
+		schema = oneOf
 	}
-	if len(parentSettings.Namespaces) > 0 {
-		allowed := make(map[string]struct{}, len(parentSettings.Namespaces))
-		for _, ns := range parentSettings.Namespaces {
-			allowed[ns] = struct{}{}
-		}
-		for _, ns := range childSettings.Namespaces {
-			if _, ok := allowed[ns]; !ok {
-				return fmt.Errorf("child namespace %q is not in parent's allowed namespaces", ns)
-			}
-		}
-		if len(childSettings.Namespaces) == 0 {
-			return fmt.Errorf("child must specify namespaces when parent restricts them")
-		}
+	scopeNote := describePermissions(settings.Permissions)
+	approvalNote := ""
+	if settings.RequireApproval != nil && *settings.RequireApproval {
+		approvalNote = " All operations require human approval."
 	}
-	return nil
+	return dispatcher.Capability{
+		Name:        name,
+		Description: fmt.Sprintf("Kubernetes operations selected by `verb` (%s). Allowed: %s.%s", strings.Join(verbs, ", "), scopeNote, approvalNote),
+		InputSchema: schema,
+	}
 }
 
-func capabilityFor(name string, settings Settings) dispatcher.Capability {
-	nsNote := "all namespaces"
-	if len(settings.Namespaces) > 0 {
-		nsNote = "namespaces: " + strings.Join(settings.Namespaces, ", ")
+func describePermissions(perms []Permission) string {
+	parts := make([]string, 0, len(perms))
+	for _, p := range perms {
+		resource := p.Resource
+		if resource == "" {
+			resource = "*"
+		}
+		ns := p.Namespace
+		if ns == "" {
+			ns = "*"
+		}
+		verb := p.Verb
+		if verb == "" {
+			verb = "*"
+		}
+		parts = append(parts, fmt.Sprintf("%s %s in %s", verb, resource, ns))
 	}
-	approvalNote := ""
-	if requiresApproval(name, settings) {
-		approvalNote = " Requires human approval."
-	}
+	return strings.Join(parts, "; ")
+}
 
-	switch name {
-	case "k8s.get":
-		return dispatcher.Capability{
-			Name:        "k8s.get",
-			Description: fmt.Sprintf("Get a Kubernetes resource by API version, kind, namespace, and name. %s.%s", nsNote, approvalNote),
-			InputSchema: json.RawMessage(`{"type":"object","properties":{"api_version":{"type":"string","description":"API version (e.g. v1, apps/v1)"},"kind":{"type":"string","description":"Resource kind (e.g. Pod, Deployment)"},"namespace":{"type":"string","description":"Namespace (omit for cluster-scoped)"},"name":{"type":"string","description":"Resource name"}},"required":["api_version","kind","name"],"additionalProperties":false}`),
-		}
-	case "k8s.list":
-		return dispatcher.Capability{
-			Name:        "k8s.list",
-			Description: fmt.Sprintf("List Kubernetes resources by API version and kind. %s.%s", nsNote, approvalNote),
-			InputSchema: json.RawMessage(`{"type":"object","properties":{"api_version":{"type":"string"},"kind":{"type":"string"},"namespace":{"type":"string"},"label_selector":{"type":"string","description":"Label selector (e.g. app=nginx)"},"field_selector":{"type":"string"},"limit":{"type":"integer","minimum":1}},"required":["api_version","kind"],"additionalProperties":false}`),
-		}
-	case "k8s.apply":
-		return dispatcher.Capability{
-			Name:        "k8s.apply",
-			Description: fmt.Sprintf("Create or update a Kubernetes resource from JSON. %s.%s", nsNote, approvalNote),
-			InputSchema: json.RawMessage(`{"type":"object","properties":{"resource":{"type":"object","description":"Full Kubernetes resource object as JSON"}},"required":["resource"],"additionalProperties":false}`),
-		}
-	case "k8s.delete":
-		return dispatcher.Capability{
-			Name:        "k8s.delete",
-			Description: fmt.Sprintf("Delete a Kubernetes resource. %s.%s", nsNote, approvalNote),
-			InputSchema: json.RawMessage(`{"type":"object","properties":{"api_version":{"type":"string"},"kind":{"type":"string"},"namespace":{"type":"string"},"name":{"type":"string"}},"required":["api_version","kind","name"],"additionalProperties":false}`),
-		}
-	case "k8s.logs":
-		return dispatcher.Capability{
-			Name:        "k8s.logs",
-			Description: fmt.Sprintf("Get logs from a Kubernetes pod. %s.%s", nsNote, approvalNote),
-			InputSchema: json.RawMessage(`{"type":"object","properties":{"namespace":{"type":"string"},"name":{"type":"string","description":"Pod name"},"container":{"type":"string","description":"Container name (for multi-container pods)"},"tail_lines":{"type":"integer","minimum":1},"limit_bytes":{"type":"integer","minimum":1}},"required":["name"],"additionalProperties":false}`),
-		}
-	case "k8s.events":
-		return dispatcher.Capability{
-			Name:        "k8s.events",
-			Description: fmt.Sprintf("List Kubernetes events. %s.%s", nsNote, approvalNote),
-			InputSchema: json.RawMessage(`{"type":"object","properties":{"namespace":{"type":"string"},"involved_object":{"type":"string","description":"Name of the resource to filter events for"},"field_selector":{"type":"string"},"limit":{"type":"integer","minimum":1}},"additionalProperties":false}`),
-		}
-	default:
-		return dispatcher.Capability{Name: name, Description: "Unknown k8s operation."}
-	}
+// verbSchemas are the per-verb branches of the union input schema. Each carries
+// a `verb` discriminator const plus that verb's operation fields.
+var verbSchemas = map[string]json.RawMessage{
+	"get":    json.RawMessage(`{"type":"object","properties":{"verb":{"const":"get"},"api_version":{"type":"string","description":"API version (e.g. v1, apps/v1)"},"kind":{"type":"string","description":"Resource kind (e.g. Pod, Deployment)"},"namespace":{"type":"string"},"name":{"type":"string"}},"required":["verb","api_version","kind","name"],"additionalProperties":false}`),
+	"list":   json.RawMessage(`{"type":"object","properties":{"verb":{"const":"list"},"api_version":{"type":"string"},"kind":{"type":"string"},"namespace":{"type":"string"},"label_selector":{"type":"string"},"field_selector":{"type":"string"},"limit":{"type":"integer","minimum":1}},"required":["verb","api_version","kind"],"additionalProperties":false}`),
+	"apply":  json.RawMessage(`{"type":"object","properties":{"verb":{"const":"apply"},"resource":{"type":"object","description":"Full Kubernetes resource object as JSON"}},"required":["verb","resource"],"additionalProperties":false}`),
+	"delete": json.RawMessage(`{"type":"object","properties":{"verb":{"const":"delete"},"api_version":{"type":"string"},"kind":{"type":"string"},"namespace":{"type":"string"},"name":{"type":"string"}},"required":["verb","api_version","kind","name"],"additionalProperties":false}`),
+	"logs":   json.RawMessage(`{"type":"object","properties":{"verb":{"const":"logs"},"namespace":{"type":"string"},"name":{"type":"string","description":"Pod name"},"container":{"type":"string"},"tail_lines":{"type":"integer","minimum":1},"limit_bytes":{"type":"integer","minimum":1}},"required":["verb","name"],"additionalProperties":false}`),
+	"events": json.RawMessage(`{"type":"object","properties":{"verb":{"const":"events"},"namespace":{"type":"string"},"involved_object":{"type":"string"},"field_selector":{"type":"string"},"limit":{"type":"integer","minimum":1}},"required":["verb"],"additionalProperties":false}`),
 }

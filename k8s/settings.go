@@ -1,63 +1,91 @@
 package k8s
 
 import (
-	"fmt"
 	"strings"
 )
 
+// Permission is one allowlisted operation: a verb on a resource kind in a
+// namespace. Empty or "*" in any field means "any". `Resource` is matched
+// case-insensitively against the call's kind (e.g. "pod" matches "Pod").
+type Permission struct {
+	Resource  string `json:"resource,omitempty"`
+	Verb      string `json:"verb,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+}
+
 type Settings struct {
-	Kubeconfig      string   `json:"kubeconfig,omitempty"`
-	Context         string   `json:"context,omitempty"`
-	Namespaces      []string `json:"namespaces,omitempty"`
-	RequireApproval *bool    `json:"require_approval,omitempty"`
+	Kubeconfig      string       `json:"kubeconfig,omitempty"`
+	Context         string       `json:"context,omitempty"`
+	Permissions     []Permission `json:"permissions"`
+	RequireApproval *bool        `json:"require_approval,omitempty"`
 }
 
-func isMutating(name string) bool {
-	return name == "k8s.apply" || name == "k8s.delete"
+// knownVerbs are the operations a k8s tool can expose, in published order.
+var knownVerbs = []string{"get", "list", "apply", "delete", "logs", "events"}
+
+func isMutatingVerb(verb string) bool {
+	return verb == "apply" || verb == "delete"
 }
 
-func requiresApproval(name string, settings Settings) bool {
-	if settings.RequireApproval != nil {
-		return *settings.RequireApproval
+// requiresApproval reports whether a verb needs human approval. An explicit
+// per-tool override wins; otherwise mutating verbs require approval.
+func requiresApproval(verb string, override *bool) bool {
+	if override != nil {
+		return *override
 	}
-	return isMutating(name)
+	return isMutatingVerb(verb)
 }
 
-type namespacePolicy struct {
-	allowed map[string]struct{}
+type permissionPolicy struct {
+	perms []Permission
 }
 
-func newNamespacePolicy(namespaces []string) namespacePolicy {
-	allowed := make(map[string]struct{}, len(namespaces))
-	for _, ns := range namespaces {
-		ns = strings.TrimSpace(ns)
-		if ns != "" {
-			allowed[ns] = struct{}{}
+func newPermissionPolicy(perms []Permission) permissionPolicy {
+	return permissionPolicy{perms: perms}
+}
+
+// allows reports whether any permission grants this (verb, kind, namespace).
+func (p permissionPolicy) allows(verb, kind, namespace string) bool {
+	for _, perm := range p.perms {
+		if matchToken(perm.Verb, verb) && matchToken(perm.Resource, kind) && matchToken(perm.Namespace, namespace) {
+			return true
 		}
 	}
-	return namespacePolicy{allowed: allowed}
+	return false
 }
 
-func (p namespacePolicy) check(namespace string, namespaced bool) error {
-	if len(p.allowed) == 0 {
-		return nil
+// permittedVerbs returns the known verbs this policy grants, in published order.
+// A wildcard (empty or "*") verb grants all known verbs.
+func (p permissionPolicy) permittedVerbs() []string {
+	wildcard := false
+	granted := make(map[string]bool, len(p.perms))
+	for _, perm := range p.perms {
+		v := strings.ToLower(strings.TrimSpace(perm.Verb))
+		if v == "" || v == "*" {
+			wildcard = true
+			break
+		}
+		granted[v] = true
 	}
-	if !namespaced {
-		return nil
+	out := make([]string, 0, len(knownVerbs))
+	for _, v := range knownVerbs {
+		if wildcard || granted[v] {
+			out = append(out, v)
+		}
 	}
-	if namespace == "" {
-		return fmt.Errorf("namespace is required (allowed: %s)", p.list())
-	}
-	if _, ok := p.allowed[namespace]; !ok {
-		return fmt.Errorf("namespace %q is not allowed (allowed: %s)", namespace, p.list())
-	}
-	return nil
+	return out
 }
 
-func (p namespacePolicy) list() string {
-	names := make([]string, 0, len(p.allowed))
-	for ns := range p.allowed {
-		names = append(names, ns)
+// matchToken matches an allowlist token against an actual value. Empty or "*"
+// matches anything; a trailing "*" is a case-insensitive prefix glob; otherwise
+// the comparison is exact and case-insensitive.
+func matchToken(allowed, actual string) bool {
+	allowed = strings.TrimSpace(allowed)
+	if allowed == "" || allowed == "*" {
+		return true
 	}
-	return strings.Join(names, ", ")
+	if prefix, ok := strings.CutSuffix(allowed, "*"); ok {
+		return strings.HasPrefix(strings.ToLower(actual), strings.ToLower(prefix))
+	}
+	return strings.EqualFold(allowed, actual)
 }

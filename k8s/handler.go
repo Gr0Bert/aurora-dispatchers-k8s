@@ -12,28 +12,31 @@ import (
 var _ builtin.Handler = (*Handler)(nil)
 
 type capabilityConfig struct {
-	settings        Settings
-	policy          namespacePolicy
-	requireApproval bool
+	client          Client
+	policy          permissionPolicy
+	requireApproval *bool
 }
 
+// Handler dispatches Kubernetes tool calls. Each tool is keyed by its local
+// manifest name; a single call carries a `verb` discriminator that selects the
+// operation, gated by the tool's permission allowlist.
 type Handler struct {
-	client       Client
 	capabilities map[string]capabilityConfig
 }
 
-func NewHandler(client Client) *Handler {
-	return &Handler{
-		client:       client,
-		capabilities: make(map[string]capabilityConfig),
-	}
+func NewHandler() *Handler {
+	return &Handler{capabilities: make(map[string]capabilityConfig)}
 }
 
 func (h *Handler) AddCapability(name string, settings Settings) {
+	client, err := NewClient(settings.Kubeconfig, settings.Context)
+	if err != nil {
+		client = &failedClient{err: err}
+	}
 	h.capabilities[name] = capabilityConfig{
-		settings:        settings,
-		policy:          newNamespacePolicy(settings.Namespaces),
-		requireApproval: requiresApproval(name, settings),
+		client:          client,
+		policy:          newPermissionPolicy(settings.Permissions),
+		requireApproval: settings.RequireApproval,
 	}
 }
 
@@ -45,36 +48,55 @@ func (h *Handler) Handles(name string) bool {
 func (h *Handler) DispatchCall(ctx context.Context, call dispatcher.Call, auth dispatcher.Authorization) (dispatcher.Outcome, error) {
 	cap, ok := h.capabilities[call.Name]
 	if !ok {
-		return dispatcher.Fail("unknown k8s call: " + call.Name), nil
+		return dispatcher.Fail("unknown k8s tool: " + call.Name), nil
 	}
-
-	switch call.Name {
-	case "k8s.get":
+	var disc struct {
+		Verb string `json:"verb"`
+	}
+	if err := json.Unmarshal(call.Args, &disc); err != nil {
+		return dispatcher.Fail(fmt.Sprintf("decode verb: %v", err)), nil
+	}
+	verb := strings.ToLower(strings.TrimSpace(disc.Verb))
+	switch verb {
+	case "get":
 		return h.dispatchGet(ctx, call, cap, auth)
-	case "k8s.list":
+	case "list":
 		return h.dispatchList(ctx, call, cap, auth)
-	case "k8s.apply":
+	case "apply":
 		return h.dispatchApply(ctx, call, cap, auth)
-	case "k8s.delete":
+	case "delete":
 		return h.dispatchDelete(ctx, call, cap, auth)
-	case "k8s.logs":
+	case "logs":
 		return h.dispatchLogs(ctx, call, cap, auth)
-	case "k8s.events":
+	case "events":
 		return h.dispatchEvents(ctx, call, cap, auth)
 	default:
-		return dispatcher.Fail("unsupported k8s operation: " + call.Name), nil
+		return dispatcher.Fail("unsupported verb: " + disc.Verb), nil
 	}
+}
+
+// permit checks the permission allowlist for an operation; it returns a Fail
+// outcome when the operation is not granted, otherwise nil.
+func permit(cap capabilityConfig, verb, kind, namespace string) *dispatcher.Outcome {
+	if cap.policy.allows(verb, kind, namespace) {
+		return nil
+	}
+	out := dispatcher.Fail(fmt.Sprintf("not permitted: %s %s in namespace %q", verb, kind, namespace))
+	return &out
 }
 
 func (h *Handler) dispatchGet(ctx context.Context, call dispatcher.Call, cap capabilityConfig, auth dispatcher.Authorization) (dispatcher.Outcome, error) {
 	var req GetRequest
 	if err := json.Unmarshal(call.Args, &req); err != nil {
-		return dispatcher.Fail(fmt.Sprintf("decode k8s.get: %v", err)), nil
+		return dispatcher.Fail(fmt.Sprintf("decode k8s get: %v", err)), nil
 	}
-	if err := checkApproval(auth, cap, fmt.Sprintf("k8s.get %s/%s %s", req.Kind, req.Name, req.Namespace)); err != nil {
+	if denied := permit(cap, "get", req.Kind, req.Namespace); denied != nil {
+		return *denied, nil
+	}
+	if err := checkApproval(auth, cap, "get", fmt.Sprintf("get %s/%s %s", req.Kind, req.Name, req.Namespace)); err != nil {
 		return *err, nil
 	}
-	obj, err := h.client.Get(ctx, req)
+	obj, err := cap.client.Get(ctx, req)
 	if err != nil {
 		if ctx.Err() != nil {
 			return dispatcher.Outcome{}, ctx.Err()
@@ -87,12 +109,15 @@ func (h *Handler) dispatchGet(ctx context.Context, call dispatcher.Call, cap cap
 func (h *Handler) dispatchList(ctx context.Context, call dispatcher.Call, cap capabilityConfig, auth dispatcher.Authorization) (dispatcher.Outcome, error) {
 	var req ListRequest
 	if err := json.Unmarshal(call.Args, &req); err != nil {
-		return dispatcher.Fail(fmt.Sprintf("decode k8s.list: %v", err)), nil
+		return dispatcher.Fail(fmt.Sprintf("decode k8s list: %v", err)), nil
 	}
-	if err := checkApproval(auth, cap, fmt.Sprintf("k8s.list %s/%s", req.Kind, req.Namespace)); err != nil {
+	if denied := permit(cap, "list", req.Kind, req.Namespace); denied != nil {
+		return *denied, nil
+	}
+	if err := checkApproval(auth, cap, "list", fmt.Sprintf("list %s/%s", req.Kind, req.Namespace)); err != nil {
 		return *err, nil
 	}
-	list, err := h.client.List(ctx, req)
+	list, err := cap.client.List(ctx, req)
 	if err != nil {
 		if ctx.Err() != nil {
 			return dispatcher.Outcome{}, ctx.Err()
@@ -109,7 +134,7 @@ func (h *Handler) dispatchList(ctx context.Context, call dispatcher.Call, cap ca
 func (h *Handler) dispatchApply(ctx context.Context, call dispatcher.Call, cap capabilityConfig, auth dispatcher.Authorization) (dispatcher.Outcome, error) {
 	var req ApplyRequest
 	if err := json.Unmarshal(call.Args, &req); err != nil {
-		return dispatcher.Fail(fmt.Sprintf("decode k8s.apply: %v", err)), nil
+		return dispatcher.Fail(fmt.Sprintf("decode k8s apply: %v", err)), nil
 	}
 	var meta struct {
 		Kind     string `json:"kind"`
@@ -119,17 +144,17 @@ func (h *Handler) dispatchApply(ctx context.Context, call dispatcher.Call, cap c
 		} `json:"metadata"`
 	}
 	_ = json.Unmarshal(req.Resource, &meta)
-	if err := cap.policy.check(meta.Metadata.Namespace, true); err != nil {
-		return dispatcher.Fail(err.Error()), nil
+	if denied := permit(cap, "apply", meta.Kind, meta.Metadata.Namespace); denied != nil {
+		return *denied, nil
 	}
-	summary := fmt.Sprintf("k8s.apply %s/%s", meta.Kind, meta.Metadata.Name)
+	summary := fmt.Sprintf("apply %s/%s", meta.Kind, meta.Metadata.Name)
 	if meta.Metadata.Namespace != "" {
 		summary += " in " + meta.Metadata.Namespace
 	}
-	if err := checkApproval(auth, cap, summary); err != nil {
+	if err := checkApproval(auth, cap, "apply", summary); err != nil {
 		return *err, nil
 	}
-	obj, action, err := h.client.Apply(ctx, req)
+	obj, action, err := cap.client.Apply(ctx, req)
 	if err != nil {
 		if ctx.Err() != nil {
 			return dispatcher.Outcome{}, ctx.Err()
@@ -142,16 +167,16 @@ func (h *Handler) dispatchApply(ctx context.Context, call dispatcher.Call, cap c
 func (h *Handler) dispatchDelete(ctx context.Context, call dispatcher.Call, cap capabilityConfig, auth dispatcher.Authorization) (dispatcher.Outcome, error) {
 	var req DeleteRequest
 	if err := json.Unmarshal(call.Args, &req); err != nil {
-		return dispatcher.Fail(fmt.Sprintf("decode k8s.delete: %v", err)), nil
+		return dispatcher.Fail(fmt.Sprintf("decode k8s delete: %v", err)), nil
 	}
-	if err := cap.policy.check(req.Namespace, true); err != nil {
-		return dispatcher.Fail(err.Error()), nil
+	if denied := permit(cap, "delete", req.Kind, req.Namespace); denied != nil {
+		return *denied, nil
 	}
-	summary := fmt.Sprintf("k8s.delete %s/%s/%s", req.Kind, req.Namespace, req.Name)
-	if err := checkApproval(auth, cap, summary); err != nil {
+	summary := fmt.Sprintf("delete %s/%s/%s", req.Kind, req.Namespace, req.Name)
+	if err := checkApproval(auth, cap, "delete", summary); err != nil {
 		return *err, nil
 	}
-	if err := h.client.Delete(ctx, req); err != nil {
+	if err := cap.client.Delete(ctx, req); err != nil {
 		if ctx.Err() != nil {
 			return dispatcher.Outcome{}, ctx.Err()
 		}
@@ -163,15 +188,15 @@ func (h *Handler) dispatchDelete(ctx context.Context, call dispatcher.Call, cap 
 func (h *Handler) dispatchLogs(ctx context.Context, call dispatcher.Call, cap capabilityConfig, auth dispatcher.Authorization) (dispatcher.Outcome, error) {
 	var req LogsRequest
 	if err := json.Unmarshal(call.Args, &req); err != nil {
-		return dispatcher.Fail(fmt.Sprintf("decode k8s.logs: %v", err)), nil
+		return dispatcher.Fail(fmt.Sprintf("decode k8s logs: %v", err)), nil
 	}
-	if err := cap.policy.check(req.Namespace, true); err != nil {
-		return dispatcher.Fail(err.Error()), nil
+	if denied := permit(cap, "logs", "Pod", req.Namespace); denied != nil {
+		return *denied, nil
 	}
-	if err := checkApproval(auth, cap, fmt.Sprintf("k8s.logs %s/%s", req.Namespace, req.Name)); err != nil {
+	if err := checkApproval(auth, cap, "logs", fmt.Sprintf("logs %s/%s", req.Namespace, req.Name)); err != nil {
 		return *err, nil
 	}
-	logs, err := h.client.Logs(ctx, req)
+	logs, err := cap.client.Logs(ctx, req)
 	if err != nil {
 		if ctx.Err() != nil {
 			return dispatcher.Outcome{}, ctx.Err()
@@ -184,12 +209,15 @@ func (h *Handler) dispatchLogs(ctx context.Context, call dispatcher.Call, cap ca
 func (h *Handler) dispatchEvents(ctx context.Context, call dispatcher.Call, cap capabilityConfig, auth dispatcher.Authorization) (dispatcher.Outcome, error) {
 	var req EventsRequest
 	if err := json.Unmarshal(call.Args, &req); err != nil {
-		return dispatcher.Fail(fmt.Sprintf("decode k8s.events: %v", err)), nil
+		return dispatcher.Fail(fmt.Sprintf("decode k8s events: %v", err)), nil
 	}
-	if err := checkApproval(auth, cap, fmt.Sprintf("k8s.events %s", req.Namespace)); err != nil {
+	if denied := permit(cap, "events", "Event", req.Namespace); denied != nil {
+		return *denied, nil
+	}
+	if err := checkApproval(auth, cap, "events", fmt.Sprintf("events %s", req.Namespace)); err != nil {
 		return *err, nil
 	}
-	list, err := h.client.Events(ctx, req)
+	list, err := cap.client.Events(ctx, req)
 	if err != nil {
 		if ctx.Err() != nil {
 			return dispatcher.Outcome{}, ctx.Err()
@@ -203,8 +231,8 @@ func (h *Handler) dispatchEvents(ctx context.Context, call dispatcher.Call, cap 
 	return marshalResult(EventsResponse{Items: items, Count: len(items)})
 }
 
-func checkApproval(auth dispatcher.Authorization, cap capabilityConfig, summary string) *dispatcher.Outcome {
-	if !cap.requireApproval {
+func checkApproval(auth dispatcher.Authorization, cap capabilityConfig, verb, summary string) *dispatcher.Outcome {
+	if !requiresApproval(verb, cap.requireApproval) {
 		return nil
 	}
 	if auth.Decision == dispatcher.Approved {

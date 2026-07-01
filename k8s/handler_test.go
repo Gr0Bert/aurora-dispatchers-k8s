@@ -42,6 +42,20 @@ func (m *mockClient) Events(_ context.Context, _ EventsRequest) (*unstructured.U
 	return m.eventsResult, m.err
 }
 
+// handlerWithMock builds a Handler holding one tool bound to a mock client.
+func handlerWithMock(name string, mc Client, settings Settings) *Handler {
+	return &Handler{capabilities: map[string]capabilityConfig{
+		name: {
+			client:          mc,
+			policy:          newPermissionPolicy(settings.Permissions),
+			requireApproval: settings.RequireApproval,
+		},
+	}}
+}
+
+// anyVerb grants every verb in any namespace.
+var anyVerb = Settings{Permissions: []Permission{{Verb: "*"}}}
+
 func TestReadOperationsReturnResultImmediately(t *testing.T) {
 	mc := &mockClient{
 		getResult:    &unstructured.Unstructured{Object: map[string]any{"kind": "Pod"}},
@@ -49,56 +63,22 @@ func TestReadOperationsReturnResultImmediately(t *testing.T) {
 		logsResult:   "some logs",
 		eventsResult: &unstructured.UnstructuredList{},
 	}
-	h := NewHandler(mc)
-	h.AddCapability("k8s.get", Settings{})
-	h.AddCapability("k8s.list", Settings{})
-	h.AddCapability("k8s.logs", Settings{})
-	h.AddCapability("k8s.events", Settings{})
-
+	h := handlerWithMock("k8sTool", mc, anyVerb)
 	ctx := context.Background()
 
-	outcome, err := h.DispatchCall(ctx, dispatcher.Call{
-		Name: "k8s.get",
-		Args: json.RawMessage(`{"api_version":"v1","kind":"Pod","name":"nginx"}`),
-	}, dispatcher.Authorization{})
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if outcome.Kind() != dispatcher.OutcomeResult {
-		t.Fatalf("get outcome = %s, want result", outcome.Kind())
-	}
-
-	outcome, err = h.DispatchCall(ctx, dispatcher.Call{
-		Name: "k8s.list",
-		Args: json.RawMessage(`{"api_version":"v1","kind":"Pod"}`),
-	}, dispatcher.Authorization{})
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if outcome.Kind() != dispatcher.OutcomeResult {
-		t.Fatalf("list outcome = %s, want result", outcome.Kind())
-	}
-
-	outcome, err = h.DispatchCall(ctx, dispatcher.Call{
-		Name: "k8s.logs",
-		Args: json.RawMessage(`{"name":"nginx"}`),
-	}, dispatcher.Authorization{})
-	if err != nil {
-		t.Fatalf("logs: %v", err)
-	}
-	if outcome.Kind() != dispatcher.OutcomeResult {
-		t.Fatalf("logs outcome = %s, want result", outcome.Kind())
-	}
-
-	outcome, err = h.DispatchCall(ctx, dispatcher.Call{
-		Name: "k8s.events",
-		Args: json.RawMessage(`{}`),
-	}, dispatcher.Authorization{})
-	if err != nil {
-		t.Fatalf("events: %v", err)
-	}
-	if outcome.Kind() != dispatcher.OutcomeResult {
-		t.Fatalf("events outcome = %s, want result", outcome.Kind())
+	for _, tc := range []struct{ name, args string }{
+		{"get", `{"verb":"get","api_version":"v1","kind":"Pod","name":"nginx"}`},
+		{"list", `{"verb":"list","api_version":"v1","kind":"Pod"}`},
+		{"logs", `{"verb":"logs","name":"nginx"}`},
+		{"events", `{"verb":"events"}`},
+	} {
+		outcome, err := h.DispatchCall(ctx, dispatcher.Call{Name: "k8sTool", Args: json.RawMessage(tc.args)}, dispatcher.Authorization{})
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if outcome.Kind() != dispatcher.OutcomeResult {
+			t.Fatalf("%s outcome = %s, want result", tc.name, outcome.Kind())
+		}
 	}
 }
 
@@ -107,12 +87,11 @@ func TestMutationYieldsWithoutApproval(t *testing.T) {
 		applyResult: &unstructured.Unstructured{Object: map[string]any{"kind": "Deployment"}},
 		applyAction: "created",
 	}
-	h := NewHandler(mc)
-	h.AddCapability("k8s.apply", Settings{})
+	h := handlerWithMock("k8sTool", mc, anyVerb)
 
 	outcome, err := h.DispatchCall(context.Background(), dispatcher.Call{
-		Name: "k8s.apply",
-		Args: json.RawMessage(`{"resource":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"nginx","namespace":"default"}}}`),
+		Name: "k8sTool",
+		Args: json.RawMessage(`{"verb":"apply","resource":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"nginx","namespace":"default"}}}`),
 	}, dispatcher.Authorization{})
 	if err != nil {
 		t.Fatalf("apply: %v", err)
@@ -127,12 +106,11 @@ func TestMutationExecutesWithApproval(t *testing.T) {
 		applyResult: &unstructured.Unstructured{Object: map[string]any{"kind": "Deployment"}},
 		applyAction: "created",
 	}
-	h := NewHandler(mc)
-	h.AddCapability("k8s.apply", Settings{})
+	h := handlerWithMock("k8sTool", mc, anyVerb)
 
 	outcome, err := h.DispatchCall(context.Background(), dispatcher.Call{
-		Name: "k8s.apply",
-		Args: json.RawMessage(`{"resource":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"nginx","namespace":"default"}}}`),
+		Name: "k8sTool",
+		Args: json.RawMessage(`{"verb":"apply","resource":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"nginx","namespace":"default"}}}`),
 	}, dispatcher.Authorization{Decision: dispatcher.Approved})
 	if err != nil {
 		t.Fatalf("apply: %v", err)
@@ -143,13 +121,11 @@ func TestMutationExecutesWithApproval(t *testing.T) {
 }
 
 func TestDeleteYieldsWithoutApproval(t *testing.T) {
-	mc := &mockClient{}
-	h := NewHandler(mc)
-	h.AddCapability("k8s.delete", Settings{})
+	h := handlerWithMock("k8sTool", &mockClient{}, anyVerb)
 
 	outcome, err := h.DispatchCall(context.Background(), dispatcher.Call{
-		Name: "k8s.delete",
-		Args: json.RawMessage(`{"api_version":"v1","kind":"Pod","namespace":"default","name":"nginx"}`),
+		Name: "k8sTool",
+		Args: json.RawMessage(`{"verb":"delete","api_version":"v1","kind":"Pod","namespace":"default","name":"nginx"}`),
 	}, dispatcher.Authorization{})
 	if err != nil {
 		t.Fatalf("delete: %v", err)
@@ -165,12 +141,11 @@ func TestApprovalCanBeDisabledForMutations(t *testing.T) {
 		applyAction: "configured",
 	}
 	f := false
-	h := NewHandler(mc)
-	h.AddCapability("k8s.apply", Settings{RequireApproval: &f})
+	h := handlerWithMock("k8sTool", mc, Settings{Permissions: []Permission{{Verb: "*"}}, RequireApproval: &f})
 
 	outcome, err := h.DispatchCall(context.Background(), dispatcher.Call{
-		Name: "k8s.apply",
-		Args: json.RawMessage(`{"resource":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"nginx","namespace":"default"}}}`),
+		Name: "k8sTool",
+		Args: json.RawMessage(`{"verb":"apply","resource":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"nginx","namespace":"default"}}}`),
 	}, dispatcher.Authorization{})
 	if err != nil {
 		t.Fatalf("apply: %v", err)
@@ -181,16 +156,13 @@ func TestApprovalCanBeDisabledForMutations(t *testing.T) {
 }
 
 func TestApprovalCanBeEnabledForReads(t *testing.T) {
-	mc := &mockClient{
-		getResult: &unstructured.Unstructured{Object: map[string]any{"kind": "Secret"}},
-	}
+	mc := &mockClient{getResult: &unstructured.Unstructured{Object: map[string]any{"kind": "Secret"}}}
 	tr := true
-	h := NewHandler(mc)
-	h.AddCapability("k8s.get", Settings{RequireApproval: &tr})
+	h := handlerWithMock("k8sTool", mc, Settings{Permissions: []Permission{{Verb: "*"}}, RequireApproval: &tr})
 
 	outcome, err := h.DispatchCall(context.Background(), dispatcher.Call{
-		Name: "k8s.get",
-		Args: json.RawMessage(`{"api_version":"v1","kind":"Secret","name":"creds"}`),
+		Name: "k8sTool",
+		Args: json.RawMessage(`{"verb":"get","api_version":"v1","kind":"Secret","name":"creds"}`),
 	}, dispatcher.Authorization{})
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -200,19 +172,33 @@ func TestApprovalCanBeEnabledForReads(t *testing.T) {
 	}
 }
 
-func TestNamespacePolicyRejectsDisallowed(t *testing.T) {
-	mc := &mockClient{}
-	h := NewHandler(mc)
-	h.AddCapability("k8s.apply", Settings{Namespaces: []string{"staging"}})
+func TestPermissionRejectsDisallowedNamespace(t *testing.T) {
+	h := handlerWithMock("k8sTool", &mockClient{}, Settings{Permissions: []Permission{{Verb: "apply", Namespace: "staging"}}})
 
 	outcome, err := h.DispatchCall(context.Background(), dispatcher.Call{
-		Name: "k8s.apply",
-		Args: json.RawMessage(`{"resource":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"nginx","namespace":"production"}}}`),
+		Name: "k8sTool",
+		Args: json.RawMessage(`{"verb":"apply","resource":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"nginx","namespace":"production"}}}`),
 	}, dispatcher.Authorization{Decision: dispatcher.Approved})
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 	if outcome.Kind() != dispatcher.OutcomeFailed {
 		t.Fatalf("apply to disallowed namespace = %s, want failed", outcome.Kind())
+	}
+}
+
+func TestPermissionRejectsUngrantedVerb(t *testing.T) {
+	// Only `get` on pods is granted; a delete must be refused.
+	h := handlerWithMock("k8sTool", &mockClient{}, Settings{Permissions: []Permission{{Verb: "get", Resource: "pod"}}})
+
+	outcome, err := h.DispatchCall(context.Background(), dispatcher.Call{
+		Name: "k8sTool",
+		Args: json.RawMessage(`{"verb":"delete","api_version":"v1","kind":"Pod","namespace":"default","name":"nginx"}`),
+	}, dispatcher.Authorization{Decision: dispatcher.Approved})
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if outcome.Kind() != dispatcher.OutcomeFailed {
+		t.Fatalf("ungranted delete = %s, want failed", outcome.Kind())
 	}
 }
